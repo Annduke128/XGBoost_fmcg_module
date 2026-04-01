@@ -22,10 +22,16 @@ class ForecastConfig:
     """Configuration for weekly forecast pipeline."""
 
     data_path: str = "data/weekly_sales.parquet"
+    daily_data_path: str | None = None
     model_dir: str = "artifacts/models"
+    factors_dir: str = "artifacts/factors"
     output_path: str = "artifacts/forecast/weekly_forecast.parquet"
     horizons: list[int] = field(default_factory=lambda: [1, 2, 4])
     scenarios: list[str] = field(default_factory=lambda: ["A", "B"])
+    holiday_csv: str | None = None
+    use_daily_features: bool = False
+    use_growth_features: bool = False
+    use_kalman_factors: bool = False
 
 
 def _ensure_ema_sales(df: pd.DataFrame) -> pd.DataFrame:
@@ -38,6 +44,74 @@ def _ensure_ema_sales(df: pd.DataFrame) -> pd.DataFrame:
         .ewm(span=8, adjust=False)
         .mean()
     )
+    return df
+
+
+def _add_extended_features(
+    df: pd.DataFrame, cfg: ForecastConfig, daily_df: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Add daily/growth/Kalman features if enabled."""
+    # Daily features
+    if cfg.use_daily_features and daily_df is not None:
+        from ml.training.features.daily_features import (
+            add_daily_time_features,
+            aggregate_daily_to_weekly,
+        )
+        from ml.training.data.daily_aggregate import (
+            add_daily_lag_rolling_ema,
+            aggregate_lag_features_to_weekly,
+        )
+
+        daily_proc = add_daily_time_features(daily_df, holiday_csv=cfg.holiday_csv)
+        weekly_time = aggregate_daily_to_weekly(daily_proc)
+
+        daily_proc = add_daily_lag_rolling_ema(daily_proc)
+        daily_proc["week"] = (
+            pd.to_datetime(daily_proc["date"])
+            .dt.to_period("W")
+            .apply(lambda p: p.start_time)
+        )
+        weekly_lag = aggregate_lag_features_to_weekly(daily_proc)
+
+        merge_keys = ["sku_id", "branch_id", "week"]
+        df = df.merge(weekly_time, on=merge_keys, how="left", suffixes=("", "_daily"))
+        df = df.merge(weekly_lag, on=merge_keys, how="left", suffixes=("", "_lag"))
+
+    # Growth features
+    if cfg.use_growth_features:
+        if "category" in df.columns and "sub_category" in df.columns:
+            from ml.training.features.growth_features import build_growth_features
+
+            df = build_growth_features(df)
+
+    # Kalman factors
+    if cfg.use_kalman_factors:
+        from ml.training.factors.seasonal_kalman import (
+            apply_seasonal_factors,
+            create_seasonal_store,
+        )
+        from ml.training.factors.promo_kalman import (
+            apply_promo_factors,
+            create_promo_store,
+        )
+        from ml.training.factors.kalman_filter import KalmanFactorStore
+
+        factors_path = Path(cfg.factors_dir)
+
+        seasonal_path = factors_path / "seasonal_factors.json"
+        if seasonal_path.exists():
+            seasonal_store = KalmanFactorStore.load(seasonal_path)
+        else:
+            seasonal_store = create_seasonal_store()
+        df = apply_seasonal_factors(df, seasonal_store)
+
+        promo_path = factors_path / "promo_factors.json"
+        if promo_path.exists():
+            promo_store = KalmanFactorStore.load(promo_path)
+        else:
+            promo_store = create_promo_store()
+        df = apply_promo_factors(df, promo_store)
+
     return df
 
 
@@ -76,6 +150,11 @@ def run_forecast(cfg: ForecastConfig | None = None) -> pd.DataFrame:
     df = validate_columns(df)
     df["week"] = pd.to_datetime(df["week"])
 
+    # Load daily data if needed
+    daily_df = None
+    if cfg.use_daily_features and cfg.daily_data_path:
+        daily_df = pd.read_parquet(cfg.daily_data_path)
+
     scenarios = build_scenarios(df)
     selected = {k: v for k, v in scenarios.items() if k in cfg.scenarios}
 
@@ -84,6 +163,10 @@ def run_forecast(cfg: ForecastConfig | None = None) -> pd.DataFrame:
         scenario_df = _ensure_ema_sales(scenario_df)
         scenario_df = assign_lead_time(scenario_df)
         scenario_df = build_all_features(scenario_df)
+
+        # Extended features
+        scenario_df = _add_extended_features(scenario_df, cfg, daily_df)
+
         scenario_df = scenario_df.dropna(subset=["lag_1"])
 
         available_features = [c for c in feature_cols if c in scenario_df.columns]
