@@ -14,6 +14,7 @@ from ml.shared.features.feature_defs import ALL_FEATURES, CAT_COLS
 from ml.shared.schema import validate_columns
 from ml.shared.utils.metrics import mae, wape
 from ml.training.data.lead_time import assign_lead_time
+from ml.training.data.promo_depth import compute_promo_depth
 from ml.training.data.split import time_split
 from ml.training.data.stockout import impute_stockout
 from ml.training.features.build_features import build_all_features
@@ -183,6 +184,7 @@ def run_train_weekly(cfg: TrainWeeklyConfig | None = None) -> dict:
 
     # 1. Load data
     df = pd.read_parquet(cfg.data_path)
+    df = compute_promo_depth(df)
     df = validate_columns(df)
     df["week"] = pd.to_datetime(df["week"])
 

@@ -14,6 +14,7 @@ REQUIRED_COLS: list[str] = [
     "branch_type",
     "stockout_flag",
     "display_units",
+    "promo_depth",
 ]
 
 
