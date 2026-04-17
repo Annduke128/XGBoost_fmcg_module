@@ -1,4 +1,16 @@
-"""Weekly forecast pipeline orchestrator."""
+"""Weekly forecast pipeline — recursive multi-step rollout.
+
+Generates demand forecasts for requested horizons (default 1, 2, 4 weeks)
+and scenarios (A = no promo, B = 50 % discount) using a trained XGBoost
+model loaded from the model registry.
+
+Key design:
+    * ``_rollout_forecast`` steps sequentially h=1..max(horizons) so that
+      each step's prediction feeds as ``lag_1`` into the next step.
+    * Intermediate steps (e.g. h=3) are computed internally for correct
+      lag propagation but excluded from output unless explicitly requested.
+    * Predictions are clipped >= 0 (Poisson target).
+"""
 
 from __future__ import annotations
 
@@ -12,6 +24,7 @@ from ml.shared.features.encode import make_categorical
 from ml.shared.features.feature_defs import ALL_FEATURES, CAT_COLS
 from ml.shared.schema import validate_columns
 from ml.training.data.lead_time import assign_lead_time
+from ml.training.data.promo_depth import compute_promo_depth
 from ml.training.data.scenario import build_scenarios
 from ml.training.features.build_features import build_all_features
 from ml.training.models.model_registry import load_latest, load_metadata
@@ -115,26 +128,88 @@ def _add_extended_features(
     return df
 
 
-def _predict_for_horizon(
+def _recompute_lags(df: pd.DataFrame) -> pd.DataFrame:
+    """Recompute lag_1/2/4, roll_4_mean, ema_4 from units per group.
+
+    Used after appending a predicted row so subsequent horizons see
+    updated lag features that incorporate prior predictions.
+    """
+    df = df.sort_values(["sku_id", "branch_id", "week"]).copy()
+    grp = df.groupby(["sku_id", "branch_id"])["units"]
+
+    for lag in [1, 2, 4]:
+        df[f"lag_{lag}"] = grp.shift(lag)
+
+    shifted = grp.shift(1)
+    df["roll_4_mean"] = shifted.rolling(4, min_periods=1).mean()
+    df["ema_4"] = shifted.ewm(span=4, adjust=False).mean()
+
+    return df
+
+
+def _rollout_forecast(
     model: object,
     df: pd.DataFrame,
-    horizon: int,
+    horizons: list[int],
     feature_cols: list[str],
 ) -> pd.DataFrame:
+    """Recursive multi-step forecast: step 1 → max(horizons).
+
+    At each step h, a placeholder row for the target week T+h is
+    appended to the working history so that ``_recompute_lags`` yields
+    correct lag values (e.g. lag_1 at T+h = units at T+h-1, which is
+    the prediction from the previous step). Intermediate steps (e.g.
+    h=3) are computed for correct lag propagation but only requested
+    horizons appear in the output.
+    """
+    _EMPTY_COLS = ["sku_id", "branch_id", "week", "horizon", "forecast_units"]
+
     latest_week = df["week"].max()
-    target_week = latest_week + pd.Timedelta(weeks=horizon)
     latest_rows = df[df["week"] == latest_week].copy()
     if latest_rows.empty:
-        return pd.DataFrame(
-            columns=["sku_id", "branch_id", "week", "horizon", "forecast_units"]
-        )
-    X_pred = latest_rows[feature_cols]
-    preds = model.predict(X_pred)
-    latest_rows = latest_rows[["sku_id", "branch_id"]].copy()
-    latest_rows["week"] = target_week
-    latest_rows["horizon"] = horizon
-    latest_rows["forecast_units"] = np.clip(preds, a_min=0, a_max=None)
-    return latest_rows
+        return pd.DataFrame(columns=_EMPTY_COLS)
+
+    max_h = max(horizons)
+    horizon_set = set(horizons)
+    collected: list[pd.DataFrame] = []
+
+    # Working copy: we append predicted rows step by step
+    working = df.copy()
+
+    for h in range(1, max_h + 1):
+        target_week = latest_week + pd.Timedelta(weeks=h)
+
+        # Template: copy non-lag features from the current latest row
+        template = working[working["week"] == working["week"].max()].copy()
+        template["week"] = target_week
+        template["units"] = 0.0  # placeholder — lags don't depend on own row
+
+        # Temporarily append and recompute lags so the target row gets
+        # lag_1 = units[T+h-1] (the previous prediction)
+        temp = pd.concat([working, template], ignore_index=True)
+        temp = _recompute_lags(temp)
+
+        # Predict from the target row's (now correct) lag features
+        pred_rows = temp[temp["week"] == target_week].copy()
+        avail = [c for c in feature_cols if c in pred_rows.columns]
+        X_pred = pred_rows[avail]
+        preds = np.clip(model.predict(X_pred), a_min=0, a_max=None)
+
+        # Collect output only for requested horizons
+        if h in horizon_set:
+            out = pred_rows[["sku_id", "branch_id"]].copy()
+            out["week"] = target_week
+            out["horizon"] = h
+            out["forecast_units"] = preds
+            collected.append(out)
+
+        # Finalize: set units = prediction for future lag computation
+        template["units"] = preds
+        working = pd.concat([working, template], ignore_index=True)
+
+    if not collected:
+        return pd.DataFrame(columns=_EMPTY_COLS)
+    return pd.concat(collected, ignore_index=True)
 
 
 def run_forecast(cfg: ForecastConfig | None = None) -> pd.DataFrame:
@@ -147,6 +222,7 @@ def run_forecast(cfg: ForecastConfig | None = None) -> pd.DataFrame:
     feature_cols = metadata.get("feature_cols", ALL_FEATURES)
 
     df = pd.read_parquet(cfg.data_path)
+    df = compute_promo_depth(df)
     df = validate_columns(df)
     df["week"] = pd.to_datetime(df["week"])
 
@@ -173,12 +249,8 @@ def run_forecast(cfg: ForecastConfig | None = None) -> pd.DataFrame:
         available_cats = [c for c in CAT_COLS if c in scenario_df.columns]
         scenario_df = make_categorical(scenario_df, available_cats)
 
-        for horizon in cfg.horizons:
-            preds = _predict_for_horizon(
-                model, scenario_df, horizon, available_features
-            )
-            if preds.empty:
-                continue
+        preds = _rollout_forecast(model, scenario_df, cfg.horizons, available_features)
+        if not preds.empty:
             preds["scenario"] = scenario_key
             outputs.append(preds)
 
