@@ -69,7 +69,8 @@ ml/
 │   │   ├── lead_time.py       # assign_lead_time() — rule: <=1→1wk, <=2→2wk, else 4wk
 │   │   ├── scenario.py        # build_scenarios() — A: no promo, B: 50% discount
 │   │   ├── holiday_calendar.py# VN holidays (CSV + built-in Tet 2023-2026)
-│   │   └── daily_aggregate.py # Daily lag/rolling/EMA → weekly _last values
+│   │   ├── daily_aggregate.py # Daily lag/rolling/EMA → weekly _last values
+│   │   └── promo_depth.py     # compute_promo_depth() — unified discount rate
 │   ├── features/
 │   │   ├── build_features.py  # add_time_features(), add_lag_features(), build_all_features()
 │   │   ├── daily_features.py  # Daily time features → weekly aggregation
@@ -95,7 +96,8 @@ ml/
 │   ├── explain/
 │   │   ├── permutation.py     # run_permutation(), select_top_features()
 │   │   ├── shap_report.py     # shap_summary(), shap_local()
-│   │   └── pdp_report.py      # pdp_plot() — PDP + ICE
+│   │   ├── pdp_report.py      # pdp_plot() — PDP + ICE
+│   │   └── promo_impact.py    # promo_type_impact(), promo_depth_curve(), promo_impact_summary()
 │   ├── replenishment/
 │   │   ├── reorder_polars.py  # compute_reorder() — ROP + order_qty via Polars
 │   │   └── self_learning.py   # EMA seasonal/branch/sigma (legacy, see Kalman)
@@ -106,8 +108,8 @@ ml/
 
 tests/                         # Mirrors ml/ structure
 ├── shared/                    # 4 test files
-├── training/                  # 14 test files
-├── forecast/                  # 6 test files
+├── training/                  # 14 test files (+1 promo_depth)
+├── forecast/                  # 6 test files (+2 forecast_weekly, promo_impact)
 └── test_cli.py                # CLI smoke tests
 
 Dockerfile                     # python:3.11-slim
@@ -119,18 +121,19 @@ docs/plans/                    # 9 implementation plan files (reference only)
 
 ### Required Input Columns (`ml/shared/schema.py`)
 
-| Column          | Type      | Description                    |
-| --------------- | --------- | ------------------------------ |
-| `week`          | datetime  | Week start date                |
-| `sku_id`        | str/cat   | Product identifier (~10k)      |
-| `branch_id`     | str/cat   | Branch/store identifier (~10k) |
-| `units`         | int/float | Target: weekly sales units     |
-| `price`         | float     | Unit price                     |
-| `promo_flag`    | int       | 0=no promo, 1=promo active     |
-| `brand_type`    | str/cat   | Brand classification           |
-| `branch_type`   | str/cat   | Branch classification          |
-| `stockout_flag` | int       | 0=in-stock, 1=stockout         |
-| `display_units` | int/float | Shelf/display capacity         |
+| Column          | Type      | Description                                                              |
+| --------------- | --------- | ------------------------------------------------------------------------ |
+| `week`          | datetime  | Week start date                                                          |
+| `sku_id`        | str/cat   | Product identifier (~10k)                                                |
+| `branch_id`     | str/cat   | Branch/store identifier (~10k)                                           |
+| `units`         | int/float | Target: weekly sales units                                               |
+| `price`         | float     | Unit price                                                               |
+| `promo_flag`    | int       | 0=no promo, 1=promo active                                               |
+| `brand_type`    | str/cat   | Brand classification                                                     |
+| `branch_type`   | str/cat   | Branch classification                                                    |
+| `stockout_flag` | int       | 0=in-stock, 1=stockout                                                   |
+| `display_units` | int/float | Shelf/display capacity                                                   |
+| `promo_depth`   | float     | Discount depth (0-1), auto-computed by `compute_promo_depth()` if absent |
 
 ### Optional Columns (for extended features)
 
@@ -139,8 +142,11 @@ docs/plans/                    # 9 implementation plan files (reference only)
 | `date`                  | daily_features, daily_aggregate | Daily-level date                                                |
 | `category`              | growth_features                 | Product category                                                |
 | `sub_category`          | growth_features                 | Product sub-category                                            |
-| `promo_type`            | promo_kalman                    | One of: discount_bundle, direct_discount, buy_x_get_y, buy_gift |
-| `promo_depth`           | daily_features                  | Discount depth (0-1)                                            |
+| `promo_type`            | promo_kalman, promo_depth       | One of: discount_bundle, direct_discount, buy_x_get_y, buy_gift |
+| `promo_discount`        | compute_promo_depth             | Raw discount rate for direct_discount/discount_bundle           |
+| `promo_x_qty`           | compute_promo_depth             | Buy X quantity (buy_x_get_y, buy_gift)                          |
+| `promo_y_qty`           | compute_promo_depth             | Get Y quantity (buy_x_get_y)                                    |
+| `gift_value`            | compute_promo_depth             | Gift monetary value (buy_gift)                                  |
 | `channel`               | segmentation                    | Sales channel                                                   |
 | `store_type`            | segmentation                    | Store type classification                                       |
 | `display_capacity_type` | segmentation                    | Display capacity tier                                           |
@@ -212,12 +218,58 @@ z = 1.65 (95% service level)
 - Symlink `latest/` → most recent version
 - Auto-rotates, keeps max 8 versions
 
+### 9. Recursive Multi-step Forecast (Rollout)
+
+Multi-horizon forecasts (h=1,2,4) use **recursive rollout** — each step's prediction feeds as `lag_1` into the next:
+
+```
+h=1: lag_1 = actual[T]        → predict(h=1)
+h=2: lag_1 = predict(h=1)     → predict(h=2)
+h=3: lag_1 = predict(h=2)     → predict(h=3)  ← internal only
+h=4: lag_1 = predict(h=3)     → predict(h=4)
+```
+
+- `_recompute_lags()` rebuilds lag_1/2/4, roll_4_mean, ema_4 per group after each step
+- Intermediate steps (h=3) computed for correct lag propagation but excluded from output
+- Predictions clipped >= 0 (Poisson target)
+- See `ml/forecast/pipelines/forecast_weekly.py:_rollout_forecast()`
+
+### 10. Promo Depth Auto-Computation
+
+`compute_promo_depth()` converts heterogeneous promo types to a unified `promo_depth` (0–1):
+
+| promo_type      | Formula                        |
+| --------------- | ------------------------------ |
+| direct_discount | `promo_discount` as-is         |
+| discount_bundle | `promo_discount` as-is         |
+| buy_x_get_y     | `y / (x + y)`                  |
+| buy_gift        | `gift_value / (price * x_qty)` |
+| no_promo / NaN  | 0.0                            |
+
+- Called **before** `validate_columns()` in both pipelines
+- Skips if `promo_depth` already present
+- Raw promo columns are optional (default to safe values)
+- Output clipped [0, 1]
+- See `ml/training/data/promo_depth.py`
+
+### 11. Promo Impact Analysis
+
+Post-forecast analysis module with three functions:
+
+- **`promo_type_impact()`**: uplift % per promo_type vs matched no-promo baseline per (sku_id, branch_id)
+- **`promo_depth_curve()`**: bins promo_depth 0–1 into equal-width buckets, computes uplift per bin
+- **`promo_impact_summary()`**: cross-tab of uplift by arbitrary group columns (default: promo_type × brand_type)
+
+All functions return empty DataFrame with correct schema on edge cases (missing columns, no promo rows).
+See `ml/forecast/explain/promo_impact.py`
+
 ## Pipeline Flow
 
 ### Training (`run_train_weekly`)
 
 ```
-Load parquet → validate_columns()
+Load parquet → compute_promo_depth()
+→ validate_columns()
 → impute_stockout()
 → assign_lead_time()
 → build_all_features()
@@ -238,12 +290,17 @@ Load parquet → validate_columns()
 
 ```
 Load parquet + load_latest model
+→ compute_promo_depth()
+→ validate_columns()
 → build features (same pipeline as training)
 → for each scenario (A, B):
-    → for each horizon (1, 2, 4 weeks):
-        → predict
-→ concat results
-→ save to output_path
+    → _rollout_forecast(horizons=[1,2,4]):
+        h=1: predict from actual lags
+        h=2: lag_1 = pred(h=1) → predict
+        h=3: lag_1 = pred(h=2) → predict (internal only)
+        h=4: lag_1 = pred(h=3) → predict
+    → collect requested horizons only
+→ concat results + save to output_path
 ```
 
 ### Replenishment
@@ -291,6 +348,7 @@ ml/shared/features/*      ← ml/training/pipelines/train_weekly
                           ← ml/forecast/pipelines/forecast_weekly
 
 ml/training/data/*        ← ml/training/pipelines/train_weekly
+                          ← ml/forecast/pipelines/forecast_weekly
 ml/training/features/*    ← ml/training/pipelines/train_weekly
 ml/training/factors/*     ← ml/training/pipelines/train_weekly
                           ← ml/forecast/pipelines/forecast_weekly
@@ -303,9 +361,11 @@ ml/forecast/segmentation/* ← (standalone, called after forecast)
 
 ## Current Status
 
-- **92/92 tests passing**
+- **131/131 tests passing**
 - All 9 implementation beads closed
 - Feature extension (daily/holiday/growth/Kalman) complete
+- Recursive multi-step forecast (rollout h=1→4) complete
+- Promo depth auto-computation + promo impact analysis complete
 - Docker packaging complete
 - **Future:** POS integration for real-time stockout data, weather API integration
 
